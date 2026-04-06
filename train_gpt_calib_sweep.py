@@ -1689,488 +1689,285 @@ def main() -> None:
     compiled_model = torch.compile(base_model, dynamic=False, fullgraph=True)
     model = compiled_model
 
-    # === QUANT-ONLY MODE: skip training, load checkpoint, jump to calibration→GPTQ→eval ===
-    if args.quant_only_checkpoint:
-        ckpt_path = args.quant_only_checkpoint
-        log0(f"quant_only_mode: loading checkpoint from {ckpt_path}")
-        ckpt_sd = torch.load(ckpt_path, map_location=device)
-        base_model.load_state_dict(ckpt_sd, strict=False)
-        log0(f"quant_only_mode: loaded {len(ckpt_sd)} tensors, skipping training")
-        torch.cuda.synchronize()
-        t_diag = time.perf_counter()
-        diag_val_loss, diag_val_bpb = eval_val(
-            args, compiled_model, rank, world_size, device, grad_accum_steps,
-            val_tokens, base_bytes_lut, has_leading_space_lut, is_boundary_token_lut,
-        )
-        torch.cuda.synchronize()
-        log0(
-            f"DIAGNOSTIC quant_only_pre_quant val_loss:{diag_val_loss:.4f} val_bpb:{diag_val_bpb:.4f} "
-            f"eval_time:{1000.0 * (time.perf_counter() - t_diag):.0f}ms"
-        )
-        full_state_dict = base_model.state_dict()
-        export_sd = {k: v for k, v in full_state_dict.items() if "mtp_heads" not in k}
-        if master_process:
-            torch.save(export_sd, "final_model.pt")
-        sd_cpu = {k: v.detach().cpu() for k, v in export_sd.items()}
-        unbanked_sd = _unbank_state_dict(sd_cpu, args.num_layers)
-        log0(f"gptq:building non-banked model for Hessian collection...")
-        hessian_model = _HessianGPT(
-            vocab_size=args.vocab_size, num_layers=args.num_layers, model_dim=args.model_dim,
-            num_heads=args.num_heads, num_kv_heads=args.num_kv_heads, mlp_mult=args.mlp_mult,
-            tie_embeddings=args.tie_embeddings, logit_softcap=args.logit_softcap,
-            rope_base=args.rope_base, qk_gain_init=args.qk_gain_init,
-            bigram_vocab_size=args.bigram_vocab_size, bigram_dim=args.bigram_dim,
-            xsa_last_n=args.xsa_last_n, rope_dims=args.rope_dims, ln_scale=args.ln_scale,
-            ve_enabled=args.ve_enabled, ve_dim=args.ve_dim, ve_layers=args.ve_layers,
-        ).to(device).bfloat16()
-        for m in hessian_model.modules():
-            if isinstance(m, CastedLinear):
-                m.float()
-        restore_low_dim_params_to_fp32(hessian_model)
-        hessian_model.load_state_dict(
-            {k: v.to(device) for k, v in unbanked_sd.items() if k in hessian_model.state_dict()},
-            strict=False,
-        )
-        prompt_ids = None
-        if args.calib_prompt_text:
-            prompt_ids = torch.tensor(sp.encode(args.calib_prompt_text), dtype=torch.long)
-            log0(f"gptq:using prompt text ({prompt_ids.numel()} tokens): {args.calib_prompt_text[:80]!r}")
-        calib_total_tokens = args.calib_num_seqs * args.calib_seq_len
-        log0(f"gptq:generating AR calibration data ({args.calib_num_seqs} seqs x {args.calib_seq_len} tokens, "
-             f"temp={args.calib_temperature}, top_p={args.calib_top_p}, top_k={args.calib_top_k}, "
-             f"batch_size={args.calib_batch_size}, total_tokens={calib_total_tokens})...")
-        base_model.load_state_dict(export_sd, strict=False)
-        t_gen = time.perf_counter()
-        ar_tokens = generate_autoregressive_calib(
-            base_model, device, num_seqs=args.calib_num_seqs, seq_len=args.calib_seq_len,
-            vocab_size=args.vocab_size, temperature=args.calib_temperature,
-            batch_size=args.calib_batch_size, seed=args.seed,
-            top_p=args.calib_top_p, top_k=args.calib_top_k, prompt_ids=prompt_ids,
-        )
-        gen_time = time.perf_counter() - t_gen
-        log0(f"gptq:generated {len(ar_tokens)} sequences in {gen_time:.1f}s "
-             f"({calib_total_tokens / gen_time:.0f} tok/s)")
-        log0(f"gptq:collecting hessians from AR data (damp_ratio={args.gptq_damp_ratio})...")
-        t_hess = time.perf_counter()
-        hessians = collect_hessians_from_tokens(hessian_model, ar_tokens, device, damp_ratio=args.gptq_damp_ratio)
-        hess_time = time.perf_counter() - t_hess
-        log0(f"gptq:collected hessians for {len(hessians)} layers in {hess_time:.1f}s (AR self-gen)")
-        del ar_tokens
-        del hessian_model
-        torch.cuda.empty_cache()
-        log0(f"gptq:quantizing with block_size={args.gptq_block_size}, damp_ratio={args.gptq_damp_ratio}...")
-        t_quant = time.perf_counter()
-        quant_result, quant_meta = mixed_quantize_int6(
-            unbanked_sd, {"mlp", "attn"}, hessians=hessians,
-            gptq_block_size=args.gptq_block_size, gptq_damp_ratio=args.gptq_damp_ratio,
-        )
-        quant_time = time.perf_counter() - t_quant
-        log0(f"gptq:quantization complete in {quant_time:.1f}s")
-        log0(f"gptq:timing summary: gen={gen_time:.1f}s hess={hess_time:.1f}s quant={quant_time:.1f}s total={gen_time+hess_time+quant_time:.1f}s")
-        target_mb = float(os.environ.get("TARGET_MB", "15.9"))
-        code_bytes_est = len(code.encode("utf-8"))
-        ones_info = []
-        for name, info in quant_meta.items():
-            if not (isinstance(info, dict) and info.get("type") == "int6"): continue
-            qk, sk = name + ".q", name + ".scale"
-            if qk not in quant_result or sk not in quant_result: continue
-            q, s = quant_result[qk], quant_result[sk]
-            if s.ndim > 0:
-                ones_mask = (q.abs() == 1)
-                if ones_mask.any():
-                    row_idx = torch.arange(q.shape[0]).unsqueeze(1).expand_as(q)[ones_mask]
-                    flat_idx = torch.arange(q.numel()).reshape(q.shape)[ones_mask]
-                    errors = s.float()[row_idx].pow(2)
-                    for fi, err in zip(flat_idx.tolist(), errors.tolist()):
-                        ones_info.append((qk, fi, err))
-        if ones_info:
-            ones_info.sort(key=lambda x: x[2])
-            def _try_prune(n):
-                tmp = {k: v.clone() for k, v in quant_result.items()}
-                for i in range(min(n, len(ones_info))):
-                    tmp[ones_info[i][0]].view(-1)[ones_info[i][1]] = 0
-                buf = io.BytesIO(); torch.save({"w": tmp, "m": quant_meta}, buf)
-                return len(lzma.compress(buf.getvalue(), preset=9)) + code_bytes_est, tmp
-            no_sz, _ = _try_prune(0)
-            target_bytes = int(target_mb * 1024 * 1024)
-            log0(f"selective_prune: {len(ones_info)} ±1 candidates, unpruned={no_sz/(1024*1024):.2f}MB target={target_mb}MB")
-            if no_sz <= target_bytes:
-                log0("selective_prune: already fits, no pruning needed")
-            else:
-                full_sz, _ = _try_prune(len(ones_info))
-                log0(f"selective_prune: full ±1 prune={full_sz/(1024*1024):.2f}MB")
-                if full_sz > target_bytes:
-                    log0("selective_prune: even full prune not enough, applying all")
-                    _, quant_result = _try_prune(len(ones_info))
-                else:
-                    lo, hi = 0, len(ones_info)
-                    while lo < hi:
-                        mid = (lo + hi) // 2
-                        sz, _ = _try_prune(mid)
-                        if sz <= target_bytes: hi = mid
-                        else: lo = mid + 1
-                    log0(f"selective_prune: pruning {lo}/{len(ones_info)} ±1 values ({100*lo/len(ones_info):.1f}%) to fit {target_mb}MB")
-                    _, quant_result = _try_prune(lo)
-        quant_buf = io.BytesIO()
-        torch.save({"w": quant_result, "m": quant_meta}, quant_buf)
-        quant_raw = quant_buf.getvalue()
-        quant_blob = lzma.compress(quant_raw, preset=9)
-        if master_process:
-            with open("final_model.int6.ptz", "wb") as f:
-                f.write(quant_blob)
-            quant_file_bytes = len(quant_blob)
-            code_bytes = len(code.encode("utf-8"))
-            log0(f"Serialized model int6+lzma: {quant_file_bytes} bytes")
-            log0(f"Total submission size int6+lzma: {quant_file_bytes + code_bytes} bytes")
-        if distributed:
-            dist.barrier()
-        with open("final_model.int6.ptz", "rb") as f:
-            quant_blob_disk = f.read()
-        quant_state = torch.load(
-            io.BytesIO(lzma.decompress(quant_blob_disk)),
-            map_location="cpu",
-        )
-        deq_unbanked = dequantize_mixed_int6(quant_state["w"], quant_state["m"], unbanked_sd)
-        deq_state = _rebank_state_dict(deq_unbanked, args.num_layers, sd_cpu)
-        eval_model = GPT(
-            vocab_size=args.vocab_size, num_layers=args.num_layers, model_dim=args.model_dim,
-            num_heads=args.num_heads, num_kv_heads=args.num_kv_heads, mlp_mult=args.mlp_mult,
-            tie_embeddings=args.tie_embeddings, tied_embed_init_std=args.tied_embed_init_std,
-            logit_softcap=args.logit_softcap, rope_base=args.rope_base, qk_gain_init=args.qk_gain_init,
-            mtp_num_heads=0, mtp_loss_weight=0.0,
-            bigram_vocab_size=args.bigram_vocab_size, bigram_dim=args.bigram_dim,
-            xsa_last_n=args.xsa_last_n,
-            rope_dims=args.rope_dims, ln_scale=args.ln_scale, dtg=args.dtg_enabled,
-            ve_enabled=args.ve_enabled, ve_dim=args.ve_dim, ve_layers=args.ve_layers,
-            gated_attention=args.gated_attention, value_residual=args.value_residual,
-        ).to(device).bfloat16()
-        eval_model.qo_bank.data = eval_model.qo_bank.data.float()
-        eval_model.kv_bank.data = eval_model.kv_bank.data.float()
-        eval_model.mlp_up_bank.data = eval_model.mlp_up_bank.data.float()
-        eval_model.mlp_down_bank.data = eval_model.mlp_down_bank.data.float()
-        for m in eval_model.modules():
-            if isinstance(m, CastedLinear):
-                m.float()
-        restore_low_dim_params_to_fp32(eval_model)
-        eval_model.load_state_dict(deq_state, strict=True)
-        compiled_eval = torch.compile(eval_model, dynamic=False, fullgraph=True)
-        torch.cuda.synchronize()
-        t_qeval = time.perf_counter()
-        q_val_loss, q_val_bpb = eval_val(
-            args, compiled_eval, rank, world_size, device, grad_accum_steps,
-            val_tokens, base_bytes_lut, has_leading_space_lut, is_boundary_token_lut,
-            eval_seq_len=effective_eval_seq_len,
-        )
-        torch.cuda.synchronize()
-        log0(
-            f"final_int6_roundtrip val_loss:{q_val_loss:.4f} val_bpb:{q_val_bpb:.4f} "
-            f"eval_time:{1000.0 * (time.perf_counter() - t_qeval):.0f}ms"
-        )
-        log0(f"final_int6_roundtrip_exact val_loss:{q_val_loss:.8f} val_bpb:{q_val_bpb:.8f}")
-        sw_seq_len = effective_eval_seq_len
-        if args.eval_stride > 0 and args.eval_stride < sw_seq_len:
-            torch.cuda.synchronize()
-            t_slide = time.perf_counter()
-            sw_val_loss, sw_val_bpb = eval_val_sliding(
-                args, eval_model, rank, world_size, device,
-                val_tokens, base_bytes_lut, has_leading_space_lut, is_boundary_token_lut,
-                stride=args.eval_stride,
-                eval_seq_len=sw_seq_len,
-            )
-            torch.cuda.synchronize()
-            log0(
-                f"final_int6_sliding_window val_loss:{sw_val_loss:.4f} val_bpb:{sw_val_bpb:.4f} "
-                f"stride:{args.eval_stride} eval_time:{1000.0 * (time.perf_counter() - t_slide):.0f}ms"
-            )
-            log0(f"final_int6_sliding_window_exact val_loss:{sw_val_loss:.8f} val_bpb:{sw_val_bpb:.8f}")
-        if args.eval_stride != 64 and 64 < sw_seq_len:
-            torch.cuda.synchronize()
-            t_slide64 = time.perf_counter()
-            sw64_val_loss, sw64_val_bpb = eval_val_sliding(
-                args, eval_model, rank, world_size, device,
-                val_tokens, base_bytes_lut, has_leading_space_lut, is_boundary_token_lut,
-                stride=64,
-                eval_seq_len=sw_seq_len,
-            )
-            torch.cuda.synchronize()
-            log0(
-                f"final_int6_sliding_window_s64 val_loss:{sw64_val_loss:.4f} val_bpb:{sw64_val_bpb:.4f} "
-                f"stride:64 eval_time:{1000.0 * (time.perf_counter() - t_slide64):.0f}ms"
-            )
-            log0(f"final_int6_sliding_window_s64_exact val_loss:{sw64_val_loss:.8f} val_bpb:{sw64_val_bpb:.8f}")
-        if distributed:
-            dist.destroy_process_group()
-        return  # quant-only mode complete
-
-    # Optimizer split:
-    # - 4 parameter banks -> Muon (batched Newton-Schulz)
-    # - token embedding -> Adam
-    # - scalars/control tensors -> Adam
-    # - bigram proj, mtp heads, VE proj -> Adam (small matrix params not worth banking)
-    matrix_params = [
-        base_model.qo_bank, base_model.kv_bank,
-        base_model.mlp_up_bank, base_model.mlp_down_bank,
-    ]
-    block_named_params = list(base_model.blocks.named_parameters())
-    scalar_params = [
-        p
-        for name, p in block_named_params
-        if p.ndim < 2 or any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
-    ]
-    if base_model.skip_weights.numel() > 0:
-        scalar_params.append(base_model.skip_weights)
-    scalar_params.append(base_model.smear.gate)
-    if base_model.bigram is not None:
-        scalar_params.append(base_model.bigram.scale)
-    token_lr = args.tied_embed_lr if args.tie_embeddings else args.embed_lr
-    tok_params = [{"params": [base_model.tok_emb.weight], "lr": token_lr, "base_lr": token_lr}]
-    if base_model.bigram is not None:
-        tok_params.append({"params": [base_model.bigram.embed.weight], "lr": token_lr, "base_lr": token_lr})
-        if base_model.bigram.proj is not None:
-            scalar_params.append(base_model.bigram.proj.weight)
-    if base_model.ve_shared is not None:
-        tok_params.append({"params": [base_model.ve_shared.embed.weight], "lr": token_lr, "base_lr": token_lr})
-        if base_model.ve_shared.proj is not None:
-            scalar_params.append(base_model.ve_shared.proj.weight)
-        scalar_params.append(base_model.ve_shared.scale)
-        for s in base_model.ve_layer_scales:
-            scalar_params.append(s)
-    optimizer_tok = torch.optim.AdamW(
-        tok_params,
-        betas=(args.beta1, args.beta2),
-        eps=args.adam_eps,
-        weight_decay=args.adam_wd,
-        fused=True,
-    )
-    optimizer_muon = Muon(
-        matrix_params,
-        lr=args.matrix_lr,
-        momentum=args.muon_momentum,
-        backend_steps=args.muon_backend_steps,
-        weight_decay=args.muon_wd,
-    )
-    for group in optimizer_muon.param_groups:
-        group["base_lr"] = args.matrix_lr
-    optimizer_scalar = torch.optim.AdamW(
-        [{"params": scalar_params, "lr": args.scalar_lr, "base_lr": args.scalar_lr}],
-        betas=(args.beta1, args.beta2),
-        eps=args.adam_eps,
-        weight_decay=args.adam_wd,
-        fused=True,
-    )
-    # Non-bank params that need manual all-reduce (replicated across GPUs)
-    replicated_params = list(optimizer_tok.param_groups[0]["params"])
-    for pg in optimizer_tok.param_groups[1:]:
-        replicated_params.extend(pg["params"])
-    replicated_params.extend(scalar_params)
-
-    optimizer_head = None
-    if base_model.lm_head is not None:
-        optimizer_head = torch.optim.Adam(
-            [{"params": [base_model.lm_head.weight], "lr": args.head_lr, "base_lr": args.head_lr}],
+    QUANT_ONLY_CHECKPOINT = os.environ.get("QUANT_ONLY_CHECKPOINT", "")
+    if QUANT_ONLY_CHECKPOINT:
+        log0(f"quant_only_mode: loading {QUANT_ONLY_CHECKPOINT}")
+        state = torch.load(QUANT_ONLY_CHECKPOINT, map_location=device)
+        base_model.load_state_dict(state, strict=True)
+    else:
+        # Optimizer split:
+        # - 4 parameter banks -> Muon (batched Newton-Schulz)
+        # - token embedding -> Adam
+        # - scalars/control tensors -> Adam
+        # - bigram proj, mtp heads, VE proj -> Adam (small matrix params not worth banking)
+        matrix_params = [
+            base_model.qo_bank, base_model.kv_bank,
+            base_model.mlp_up_bank, base_model.mlp_down_bank,
+        ]
+        block_named_params = list(base_model.blocks.named_parameters())
+        scalar_params = [
+            p
+            for name, p in block_named_params
+            if p.ndim < 2 or any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
+        ]
+        if base_model.skip_weights.numel() > 0:
+            scalar_params.append(base_model.skip_weights)
+        scalar_params.append(base_model.smear.gate)
+        if base_model.bigram is not None:
+            scalar_params.append(base_model.bigram.scale)
+        token_lr = args.tied_embed_lr if args.tie_embeddings else args.embed_lr
+        tok_params = [{"params": [base_model.tok_emb.weight], "lr": token_lr, "base_lr": token_lr}]
+        if base_model.bigram is not None:
+            tok_params.append({"params": [base_model.bigram.embed.weight], "lr": token_lr, "base_lr": token_lr})
+            if base_model.bigram.proj is not None:
+                scalar_params.append(base_model.bigram.proj.weight)
+        if base_model.ve_shared is not None:
+            tok_params.append({"params": [base_model.ve_shared.embed.weight], "lr": token_lr, "base_lr": token_lr})
+            if base_model.ve_shared.proj is not None:
+                scalar_params.append(base_model.ve_shared.proj.weight)
+            scalar_params.append(base_model.ve_shared.scale)
+            for s in base_model.ve_layer_scales:
+                scalar_params.append(s)
+        optimizer_tok = torch.optim.AdamW(
+            tok_params,
             betas=(args.beta1, args.beta2),
             eps=args.adam_eps,
+            weight_decay=args.adam_wd,
             fused=True,
         )
-        replicated_params.append(base_model.lm_head.weight)
-    optimizers: list[torch.optim.Optimizer] = [optimizer_tok, optimizer_muon, optimizer_scalar]
-    if optimizer_head is not None:
-        optimizers.append(optimizer_head)
-    n_params = sum(p.numel() for p in base_model.parameters())
-    mtp_params = sum(p.numel() for p in base_model.mtp_heads.parameters())
-    log0(f"model_params:{n_params}")
-    log0(f"mtp_num_heads:{args.mtp_num_heads} mtp_loss_weight:{args.mtp_loss_weight} mtp_params:{mtp_params}")
-    xsa_layers = [i for i, b in enumerate(base_model.blocks) if b.attn.use_xsa]
-    log0(f"XSA:last_{args.xsa_last_n} active_layers:{xsa_layers}")
-    log0(f"world_size:{world_size} grad_accum_steps:{grad_accum_steps}")
-    log0("sdp_backends:cudnn=False flash=True mem_efficient=False math=False")
-    log0(f"attention_mode:gqa num_heads:{args.num_heads} num_kv_heads:{args.num_kv_heads}")
-    log0(
-        f"tie_embeddings:{args.tie_embeddings} embed_lr:{token_lr} "
-        f"head_lr:{args.head_lr if base_model.lm_head is not None else 0.0} "
-        f"matrix_lr:{args.matrix_lr} scalar_lr:{args.scalar_lr}"
-    )
-    log0(
-        f"train_batch_tokens:{args.train_batch_tokens} train_seq_len:{args.train_seq_len} "
-        f"iterations:{args.iterations} warmup_steps:{args.warmup_steps} "
-        f"max_wallclock_seconds:{args.max_wallclock_seconds:.3f}"
-    )
-    log0(f"seed:{args.seed}")
-    train_loader = DistributedTokenLoader(args.train_files, rank, world_size, device)
-    def zero_grad_all() -> None:
-        for opt in optimizers:
-            opt.zero_grad(set_to_none=True)
-    max_wallclock_ms = 1000.0 * args.max_wallclock_seconds if args.max_wallclock_seconds > 0 else None
-    def lr_mul(step: int, elapsed_ms: float) -> float:
-        if args.warmdown_iters <= 0:
-            return 1.0
-        if max_wallclock_ms is None:
-            warmdown_start = max(args.iterations - args.warmdown_iters, 0)
-            return max((args.iterations - step) / max(args.warmdown_iters, 1), 0.0) if warmdown_start <= step < args.iterations else 1.0
-        step_ms = elapsed_ms / max(step, 1)
-        warmdown_ms = args.warmdown_iters * step_ms
-        remaining_ms = max(max_wallclock_ms - elapsed_ms, 0.0)
-        return remaining_ms / max(warmdown_ms, 1e-9) if remaining_ms <= warmdown_ms else 1.0
-    if args.warmup_steps > 0:
-        initial_model_state = {name: tensor.detach().cpu().clone() for name, tensor in base_model.state_dict().items()}
-        initial_optimizer_states = [copy.deepcopy(opt.state_dict()) for opt in optimizers]
-        model.train()
-        for warmup_step in range(args.warmup_steps):
+        optimizer_muon = Muon(
+            matrix_params,
+            lr=args.matrix_lr,
+            momentum=args.muon_momentum,
+            backend_steps=args.muon_backend_steps,
+            weight_decay=args.muon_wd,
+        )
+        for group in optimizer_muon.param_groups:
+            group["base_lr"] = args.matrix_lr
+        optimizer_scalar = torch.optim.AdamW(
+            [{"params": scalar_params, "lr": args.scalar_lr, "base_lr": args.scalar_lr}],
+            betas=(args.beta1, args.beta2),
+            eps=args.adam_eps,
+            weight_decay=args.adam_wd,
+            fused=True,
+        )
+        # Non-bank params that need manual all-reduce (replicated across GPUs)
+        replicated_params = list(optimizer_tok.param_groups[0]["params"])
+        for pg in optimizer_tok.param_groups[1:]:
+            replicated_params.extend(pg["params"])
+        replicated_params.extend(scalar_params)
+
+        optimizer_head = None
+        if base_model.lm_head is not None:
+            optimizer_head = torch.optim.Adam(
+                [{"params": [base_model.lm_head.weight], "lr": args.head_lr, "base_lr": args.head_lr}],
+                betas=(args.beta1, args.beta2),
+                eps=args.adam_eps,
+                fused=True,
+            )
+            replicated_params.append(base_model.lm_head.weight)
+        optimizers: list[torch.optim.Optimizer] = [optimizer_tok, optimizer_muon, optimizer_scalar]
+        if optimizer_head is not None:
+            optimizers.append(optimizer_head)
+        n_params = sum(p.numel() for p in base_model.parameters())
+        mtp_params = sum(p.numel() for p in base_model.mtp_heads.parameters())
+        log0(f"model_params:{n_params}")
+        log0(f"mtp_num_heads:{args.mtp_num_heads} mtp_loss_weight:{args.mtp_loss_weight} mtp_params:{mtp_params}")
+        xsa_layers = [i for i, b in enumerate(base_model.blocks) if b.attn.use_xsa]
+        log0(f"XSA:last_{args.xsa_last_n} active_layers:{xsa_layers}")
+        log0(f"world_size:{world_size} grad_accum_steps:{grad_accum_steps}")
+        log0("sdp_backends:cudnn=False flash=True mem_efficient=False math=False")
+        log0(f"attention_mode:gqa num_heads:{args.num_heads} num_kv_heads:{args.num_kv_heads}")
+        log0(
+            f"tie_embeddings:{args.tie_embeddings} embed_lr:{token_lr} "
+            f"head_lr:{args.head_lr if base_model.lm_head is not None else 0.0} "
+            f"matrix_lr:{args.matrix_lr} scalar_lr:{args.scalar_lr}"
+        )
+        log0(
+            f"train_batch_tokens:{args.train_batch_tokens} train_seq_len:{args.train_seq_len} "
+            f"iterations:{args.iterations} warmup_steps:{args.warmup_steps} "
+            f"max_wallclock_seconds:{args.max_wallclock_seconds:.3f}"
+        )
+        log0(f"seed:{args.seed}")
+        train_loader = DistributedTokenLoader(args.train_files, rank, world_size, device)
+        def zero_grad_all() -> None:
+            for opt in optimizers:
+                opt.zero_grad(set_to_none=True)
+        max_wallclock_ms = 1000.0 * args.max_wallclock_seconds if args.max_wallclock_seconds > 0 else None
+        def lr_mul(step: int, elapsed_ms: float) -> float:
+            if args.warmdown_iters <= 0:
+                return 1.0
+            if max_wallclock_ms is None:
+                warmdown_start = max(args.iterations - args.warmdown_iters, 0)
+                return max((args.iterations - step) / max(args.warmdown_iters, 1), 0.0) if warmdown_start <= step < args.iterations else 1.0
+            step_ms = elapsed_ms / max(step, 1)
+            warmdown_ms = args.warmdown_iters * step_ms
+            remaining_ms = max(max_wallclock_ms - elapsed_ms, 0.0)
+            return remaining_ms / max(warmdown_ms, 1e-9) if remaining_ms <= warmdown_ms else 1.0
+        if args.warmup_steps > 0:
+            initial_model_state = {name: tensor.detach().cpu().clone() for name, tensor in base_model.state_dict().items()}
+            initial_optimizer_states = [copy.deepcopy(opt.state_dict()) for opt in optimizers]
+            model.train()
+            for warmup_step in range(args.warmup_steps):
+                zero_grad_all()
+                for micro_step in range(grad_accum_steps):
+                    x, y = train_loader.next_batch(args.train_batch_tokens, args.train_seq_len, grad_accum_steps)
+                    with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
+                        warmup_loss = model(x, y)
+                    (warmup_loss * grad_scale).backward()
+                # All-reduce all grads for warmup (simple, not optimized)
+                if distributed:
+                    for p in base_model.parameters():
+                        if p.grad is not None:
+                            dist.all_reduce(p.grad, op=dist.ReduceOp.AVG)
+                for opt in optimizers:
+                    opt.step()
+                zero_grad_all()
+                if args.warmup_steps <= 20 or (warmup_step + 1) % 10 == 0 or warmup_step + 1 == args.warmup_steps:
+                    log0(f"warmup_step:{warmup_step + 1}/{args.warmup_steps}")
+            base_model.load_state_dict(initial_model_state, strict=True)
+            for opt, state in zip(optimizers, initial_optimizer_states, strict=True):
+                opt.load_state_dict(state)
             zero_grad_all()
+            train_loader = DistributedTokenLoader(args.train_files, rank, world_size, device)
+        swa_state: dict[str, Tensor] | None = None
+        swa_count = 0
+        from collections import deque
+        lawa_queue: deque[dict[str, Tensor]] = deque(maxlen=args.lawa_k)
+        ema_state = {name: t.detach().float().clone() for name, t in base_model.state_dict().items()}
+        ema_decay = 0.997
+        training_time_ms = 0.0
+        stop_after_step: int | None = None
+        torch.cuda.synchronize()
+        t0 = time.perf_counter()
+        step = 0
+        while True:
+            last_step = step == args.iterations or (stop_after_step is not None and step >= stop_after_step)
+            should_validate = last_step or (args.val_loss_every > 0 and step % args.val_loss_every == 0)
+            if should_validate:
+                torch.cuda.synchronize()
+                training_time_ms += 1000.0 * (time.perf_counter() - t0)
+                val_loss, val_bpb = eval_val(
+                    args,
+                    model,
+                    rank,
+                    world_size,
+                    device,
+                    grad_accum_steps,
+                    val_tokens,
+                    base_bytes_lut,
+                    has_leading_space_lut,
+                    is_boundary_token_lut,
+                )
+                log0(
+                    f"step:{step}/{args.iterations} val_loss:{val_loss:.4f} val_bpb:{val_bpb:.4f} "
+                    f"train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms / max(step, 1):.2f}ms"
+                )
+                torch.cuda.synchronize()
+                t0 = time.perf_counter()
+            if last_step:
+                if stop_after_step is not None and step < args.iterations:
+                    log0(
+                        f"stopping_early: wallclock_cap train_time:{training_time_ms:.0f}ms "
+                        f"step:{step}/{args.iterations}"
+                    )
+                break
+            elapsed_ms = training_time_ms + 1000.0 * (time.perf_counter() - t0)
+            scale = lr_mul(step, elapsed_ms)
+            if args.late_qat_threshold > 0 and scale < args.late_qat_threshold and not CastedLinear._qat_enabled:
+                CastedLinear._qat_enabled = True
+                log0(f"late_qat:enabled step:{step} scale:{scale:.4f}")
+            zero_grad_all()
+            train_loss = torch.zeros((), device=device)
             for micro_step in range(grad_accum_steps):
                 x, y = train_loader.next_batch(args.train_batch_tokens, args.train_seq_len, grad_accum_steps)
                 with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
-                    warmup_loss = model(x, y)
-                (warmup_loss * grad_scale).backward()
-            # All-reduce all grads for warmup (simple, not optimized)
+                    loss = model(x, y)
+                train_loss += loss.detach()
+                (loss * grad_scale).backward()
+            train_loss /= grad_accum_steps
+            frac = min(step / args.muon_momentum_warmup_steps, 1.0) if args.muon_momentum_warmup_steps > 0 else 1.0
+            muon_momentum = (1 - frac) * args.muon_momentum_warmup_start + frac * args.muon_momentum
+            for group in optimizer_muon.param_groups:
+                group["momentum"] = muon_momentum
+            for opt in optimizers:
+                for group in opt.param_groups:
+                    group["lr"] = group["base_lr"] * scale
+            if args.grad_clip_norm > 0:
+                torch.nn.utils.clip_grad_norm_(base_model.parameters(), args.grad_clip_norm)
+            # === 3-phase overlapped optimizer step ===
+            # Phase 1: Launch async reduce-scatter for banks (biggest first)
+            optimizer_muon.launch_reduce_scatters()
+            # Phase 2: All-reduce non-bank grads + step Adam (while bank RS is in-flight)
             if distributed:
-                for p in base_model.parameters():
+                for p in replicated_params:
                     if p.grad is not None:
                         dist.all_reduce(p.grad, op=dist.ReduceOp.AVG)
-            for opt in optimizers:
-                opt.step()
+            optimizer_tok.step()
+            optimizer_scalar.step()
+            if optimizer_head is not None:
+                optimizer_head.step()
+            # Phase 3: Wait for RS, local NS5, all-gather (banks processed last)
+            optimizer_muon.step()
             zero_grad_all()
-            if args.warmup_steps <= 20 or (warmup_step + 1) % 10 == 0 or warmup_step + 1 == args.warmup_steps:
-                log0(f"warmup_step:{warmup_step + 1}/{args.warmup_steps}")
-        base_model.load_state_dict(initial_model_state, strict=True)
-        for opt, state in zip(optimizers, initial_optimizer_states, strict=True):
-            opt.load_state_dict(state)
-        zero_grad_all()
-        train_loader = DistributedTokenLoader(args.train_files, rank, world_size, device)
-    swa_state: dict[str, Tensor] | None = None
-    swa_count = 0
-    from collections import deque
-    lawa_queue: deque[dict[str, Tensor]] = deque(maxlen=args.lawa_k)
-    ema_state = {name: t.detach().float().clone() for name, t in base_model.state_dict().items()}
-    ema_decay = 0.997
-    training_time_ms = 0.0
-    stop_after_step: int | None = None
-    torch.cuda.synchronize()
-    t0 = time.perf_counter()
-    step = 0
-    while True:
-        last_step = step == args.iterations or (stop_after_step is not None and step >= stop_after_step)
-        should_validate = last_step or (args.val_loss_every > 0 and step % args.val_loss_every == 0)
-        if should_validate:
-            torch.cuda.synchronize()
-            training_time_ms += 1000.0 * (time.perf_counter() - t0)
-            val_loss, val_bpb = eval_val(
-                args,
-                model,
-                rank,
-                world_size,
-                device,
-                grad_accum_steps,
-                val_tokens,
-                base_bytes_lut,
-                has_leading_space_lut,
-                is_boundary_token_lut,
-            )
-            log0(
-                f"step:{step}/{args.iterations} val_loss:{val_loss:.4f} val_bpb:{val_bpb:.4f} "
-                f"train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms / max(step, 1):.2f}ms"
-            )
-            torch.cuda.synchronize()
-            t0 = time.perf_counter()
-        if last_step:
-            if stop_after_step is not None and step < args.iterations:
-                log0(
-                    f"stopping_early: wallclock_cap train_time:{training_time_ms:.0f}ms "
-                    f"step:{step}/{args.iterations}"
-                )
-            break
-        elapsed_ms = training_time_ms + 1000.0 * (time.perf_counter() - t0)
-        scale = lr_mul(step, elapsed_ms)
-        if args.late_qat_threshold > 0 and scale < args.late_qat_threshold and not CastedLinear._qat_enabled:
-            CastedLinear._qat_enabled = True
-            log0(f"late_qat:enabled step:{step} scale:{scale:.4f}")
-        zero_grad_all()
-        train_loss = torch.zeros((), device=device)
-        for micro_step in range(grad_accum_steps):
-            x, y = train_loader.next_batch(args.train_batch_tokens, args.train_seq_len, grad_accum_steps)
-            with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
-                loss = model(x, y)
-            train_loss += loss.detach()
-            (loss * grad_scale).backward()
-        train_loss /= grad_accum_steps
-        frac = min(step / args.muon_momentum_warmup_steps, 1.0) if args.muon_momentum_warmup_steps > 0 else 1.0
-        muon_momentum = (1 - frac) * args.muon_momentum_warmup_start + frac * args.muon_momentum
-        for group in optimizer_muon.param_groups:
-            group["momentum"] = muon_momentum
-        for opt in optimizers:
-            for group in opt.param_groups:
-                group["lr"] = group["base_lr"] * scale
-        if args.grad_clip_norm > 0:
-            torch.nn.utils.clip_grad_norm_(base_model.parameters(), args.grad_clip_norm)
-        # === 3-phase overlapped optimizer step ===
-        # Phase 1: Launch async reduce-scatter for banks (biggest first)
-        optimizer_muon.launch_reduce_scatters()
-        # Phase 2: All-reduce non-bank grads + step Adam (while bank RS is in-flight)
-        if distributed:
-            for p in replicated_params:
-                if p.grad is not None:
-                    dist.all_reduce(p.grad, op=dist.ReduceOp.AVG)
-        optimizer_tok.step()
-        optimizer_scalar.step()
-        if optimizer_head is not None:
-            optimizer_head.step()
-        # Phase 3: Wait for RS, local NS5, all-gather (banks processed last)
-        optimizer_muon.step()
-        zero_grad_all()
-        # EMA update
-        with torch.no_grad():
-            for name, t in base_model.state_dict().items():
-                ema_state[name].mul_(ema_decay).add_(t.detach().float(), alpha=1.0 - ema_decay)
-        step += 1
-        approx_training_time_ms = training_time_ms + 1000.0 * (time.perf_counter() - t0)
-        if args.swa_enabled and scale < 0.2 and step % args.swa_every == 0:
-            if swa_state is None:
-                swa_state = {name: t.detach().cpu().clone() for name, t in base_model.state_dict().items()}
-                swa_count = 1
-                log0(f"swa:start step:{step}")
-            else:
+            # EMA update
+            with torch.no_grad():
                 for name, t in base_model.state_dict().items():
-                    swa_state[name] += t.detach().cpu()
-                swa_count += 1
-        if args.lawa_enabled and step % args.lawa_freq == 0:
-            lawa_queue.append({name: t.detach().cpu().clone() for name, t in base_model.state_dict().items()})
-        should_log_train = (
-            args.train_log_every > 0
-            and (step <= 10 or step % args.train_log_every == 0 or stop_after_step is not None)
-        )
-        if should_log_train:
-            log0(
-                f"step:{step}/{args.iterations} train_loss:{train_loss.item():.4f} "
-                f"train_time:{approx_training_time_ms:.0f}ms step_avg:{approx_training_time_ms / step:.2f}ms"
+                    ema_state[name].mul_(ema_decay).add_(t.detach().float(), alpha=1.0 - ema_decay)
+            step += 1
+            approx_training_time_ms = training_time_ms + 1000.0 * (time.perf_counter() - t0)
+            if args.swa_enabled and scale < 0.2 and step % args.swa_every == 0:
+                if swa_state is None:
+                    swa_state = {name: t.detach().cpu().clone() for name, t in base_model.state_dict().items()}
+                    swa_count = 1
+                    log0(f"swa:start step:{step}")
+                else:
+                    for name, t in base_model.state_dict().items():
+                        swa_state[name] += t.detach().cpu()
+                    swa_count += 1
+            if args.lawa_enabled and step % args.lawa_freq == 0:
+                lawa_queue.append({name: t.detach().cpu().clone() for name, t in base_model.state_dict().items()})
+            should_log_train = (
+                args.train_log_every > 0
+                and (step <= 10 or step % args.train_log_every == 0 or stop_after_step is not None)
             )
-        reached_cap = max_wallclock_ms is not None and approx_training_time_ms >= max_wallclock_ms
-        if distributed and max_wallclock_ms is not None:
-            reached_cap_tensor = torch.tensor(int(reached_cap), device=device)
-            dist.all_reduce(reached_cap_tensor, op=dist.ReduceOp.MAX)
-            reached_cap = bool(reached_cap_tensor.item())
-        if stop_after_step is None and reached_cap:
-            stop_after_step = step
-    log0(
-        f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB "
-        f"reserved: {torch.cuda.max_memory_reserved() // 1024 // 1024} MiB"
-    )
-    # Apply weight averaging
-    if args.lawa_enabled and len(lawa_queue) > 1:
-        log0(f"lawa:applying LAWA averaging k={len(lawa_queue)}")
-        current_state = base_model.state_dict()
-        avg_state = {name: torch.zeros(t.shape, dtype=torch.float32, device='cpu') for name, t in current_state.items()}
-        for snap in lawa_queue:
+            if should_log_train:
+                log0(
+                    f"step:{step}/{args.iterations} train_loss:{train_loss.item():.4f} "
+                    f"train_time:{approx_training_time_ms:.0f}ms step_avg:{approx_training_time_ms / step:.2f}ms"
+                )
+            reached_cap = max_wallclock_ms is not None and approx_training_time_ms >= max_wallclock_ms
+            if distributed and max_wallclock_ms is not None:
+                reached_cap_tensor = torch.tensor(int(reached_cap), device=device)
+                dist.all_reduce(reached_cap_tensor, op=dist.ReduceOp.MAX)
+                reached_cap = bool(reached_cap_tensor.item())
+            if stop_after_step is None and reached_cap:
+                stop_after_step = step
+        log0(
+            f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB "
+            f"reserved: {torch.cuda.max_memory_reserved() // 1024 // 1024} MiB"
+        )
+        # Apply weight averaging
+        if args.lawa_enabled and len(lawa_queue) > 1:
+            log0(f"lawa:applying LAWA averaging k={len(lawa_queue)}")
+            current_state = base_model.state_dict()
+            avg_state = {name: torch.zeros(t.shape, dtype=torch.float32, device='cpu') for name, t in current_state.items()}
+            for snap in lawa_queue:
+                for name in avg_state:
+                    avg_state[name] += snap[name].float()
             for name in avg_state:
-                avg_state[name] += snap[name].float()
-        for name in avg_state:
-            avg_state[name] /= len(lawa_queue)
-            avg_state[name] = avg_state[name].to(dtype=current_state[name].dtype)
-        base_model.load_state_dict(avg_state, strict=True)
-    else:
-        log0("ema:applying EMA weights")
-        current_state = base_model.state_dict()
-        avg_state = {name: t.to(dtype=current_state[name].dtype) for name, t in ema_state.items()}
-        base_model.load_state_dict(avg_state, strict=True)
+                avg_state[name] /= len(lawa_queue)
+                avg_state[name] = avg_state[name].to(dtype=current_state[name].dtype)
+            base_model.load_state_dict(avg_state, strict=True)
+        else:
+            log0("ema:applying EMA weights")
+            current_state = base_model.state_dict()
+            avg_state = {name: t.to(dtype=current_state[name].dtype) for name, t in ema_state.items()}
+            base_model.load_state_dict(avg_state, strict=True)
+        ckpt_path = f"logs/{args.run_id}_ema_checkpoint.pt"
+        if master_process:
+            torch.save(base_model.state_dict(), ckpt_path)
+            log0(f"saved_checkpoint:{ckpt_path}")
     torch.cuda.synchronize()
     t_diag = time.perf_counter()
     diag_val_loss, diag_val_bpb = eval_val(
