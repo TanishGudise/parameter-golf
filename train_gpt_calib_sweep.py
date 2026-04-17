@@ -103,6 +103,14 @@ class Hyperparameters:
     calib_top_p = float(os.environ.get("CALIB_TOP_P", 0.0))
     calib_top_k = int(os.environ.get("CALIB_TOP_K", 0))
     calib_prompt_text = os.environ.get("CALIB_PROMPT_TEXT", "")
+    # Mixed-regime calibration: independent seq config per module type
+    calib_split_by_module = bool(int(os.environ.get("CALIB_SPLIT_BY_MODULE", "0")))
+    calib_attn_num_seqs = int(os.environ.get("CALIB_ATTN_NUM_SEQS", os.environ.get("CALIB_NUM_SEQS", 64)))
+    calib_attn_seq_len = int(os.environ.get("CALIB_ATTN_SEQ_LEN", os.environ.get("CALIB_SEQ_LEN", 2048)))
+    calib_mlp_num_seqs = int(os.environ.get("CALIB_MLP_NUM_SEQS", os.environ.get("CALIB_NUM_SEQS", 64)))
+    calib_mlp_seq_len = int(os.environ.get("CALIB_MLP_SEQ_LEN", os.environ.get("CALIB_SEQ_LEN", 2048)))
+    # Per-layer QK-gain init schedule (comma-separated, length = num_layers)
+    qk_gain_init_schedule = os.environ.get("QK_GAIN_INIT_SCHEDULE", "")
     # Quant-only mode: skip training, load checkpoint, run calib→GPTQ→eval
     quant_only_checkpoint = os.environ.get("QUANT_ONLY_CHECKPOINT", "")
 
@@ -606,6 +614,14 @@ def apply_rotary_emb(x: Tensor, cos: Tensor, sin: Tensor, rope_dims: int = 0) ->
     x1, x2 = x[..., :half], x[..., half:]
     return torch.cat((x1 * cos + x2 * sin, x1 * (-sin) + x2 * cos), dim=-1)
 
+def _resolve_qk_gain_for_layer(qk_gain_init: float, qk_gain_init_schedule: str, layer_idx: int) -> float:
+    """Return the qk_gain_init for a given layer. If schedule is provided, use it."""
+    if qk_gain_init_schedule:
+        parts = [float(x.strip()) for x in qk_gain_init_schedule.split(",") if x.strip()]
+        if layer_idx < len(parts):
+            return parts[layer_idx]
+    return qk_gain_init
+
 class CausalSelfAttention(nn.Module):
     def __init__(
         self,
@@ -616,6 +632,8 @@ class CausalSelfAttention(nn.Module):
         qk_gain_init: float,
         gated_attention: bool = False,
         value_residual: bool = False,
+        layer_idx: int = 0,
+        qk_gain_init_schedule: str = "",
     ):
         super().__init__()
         if dim % num_heads != 0:
@@ -627,8 +645,9 @@ class CausalSelfAttention(nn.Module):
         self.head_dim = dim // num_heads
         if self.head_dim % 2 != 0:
             raise ValueError("head_dim must be even for RoPE")
+        effective_gain = _resolve_qk_gain_for_layer(qk_gain_init, qk_gain_init_schedule, layer_idx)
         # No CastedLinear -- weights come from banks
-        self.q_gain = nn.Parameter(torch.full((num_heads,), qk_gain_init, dtype=torch.float32))
+        self.q_gain = nn.Parameter(torch.full((num_heads,), effective_gain, dtype=torch.float32))
         self.rope_dims = 0  # set by GPT.__init__ for partial RoPE
         self.rotary = Rotary(self.head_dim, base=rope_base, train_seq_len=1024)
         self.use_xsa = False  # set by GPT.__init__ for deep layers only
@@ -761,12 +780,14 @@ class Block(nn.Module):
         dtg: bool = False,
         gated_attention: bool = False,
         value_residual: bool = False,
+        qk_gain_init_schedule: str = "",
     ):
         super().__init__()
         self.attn_norm = RMSNorm()
         self.mlp_norm = RMSNorm()
         self.attn = CausalSelfAttention(dim, num_heads, num_kv_heads, rope_base, qk_gain_init,
-                                        gated_attention=gated_attention, value_residual=value_residual)
+                                        gated_attention=gated_attention, value_residual=value_residual,
+                                        layer_idx=layer_idx, qk_gain_init_schedule=qk_gain_init_schedule)
         self.mlp = MLP(dim, mlp_mult)
         self.attn_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
         self.mlp_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
@@ -816,6 +837,7 @@ class GPT(nn.Module):
         ve_layers: str = "9,10",
         gated_attention: bool = False,
         value_residual: bool = False,
+        qk_gain_init_schedule: str = "",
     ):
         super().__init__()
         self._ve_target_dim = num_kv_heads * (model_dim // num_heads)  # kv_dim for value projection
@@ -857,6 +879,7 @@ class GPT(nn.Module):
                     dtg=dtg,
                     gated_attention=gated_attention,
                     value_residual=value_residual,
+                    qk_gain_init_schedule=qk_gain_init_schedule,
                 )
                 for i in range(num_layers)
             ]
@@ -1164,6 +1187,91 @@ def collect_hessians_from_tokens(hessian_model, token_seqs, device, damp_ratio=0
     return hessians
 
 
+def collect_hessians_split_by_module(hessian_model, attn_token_seqs, mlp_token_seqs, device, damp_ratio=0.01):
+    """Collect Hessians with independent calibration data for attention vs MLP modules.
+    attn_token_seqs feeds .attn. layers, mlp_token_seqs feeds .mlp. layers."""
+    hessians = {}
+    for module_type, token_seqs in [("attn", attn_token_seqs), ("mlp", mlp_token_seqs)]:
+        hooks = []
+        local_hessians = {}
+        for name, module in hessian_model.named_modules():
+            if not isinstance(module, CastedLinear):
+                continue
+            param_name = name + ".weight"
+            cat = _classify_param(param_name)
+            if cat != module_type:
+                continue
+            cols = module.weight.shape[1]
+            local_hessians[param_name] = torch.zeros(cols, cols, dtype=torch.float32, device='cpu')
+            def make_hook(pname):
+                def hook_fn(module, input, output):
+                    x = input[0].detach().float()
+                    if x.ndim == 3:
+                        x = x.reshape(-1, x.shape[-1])
+                    local_hessians[pname] += (x.T @ x).cpu()
+                return hook_fn
+            h = module.register_forward_hook(make_hook(param_name))
+            hooks.append(h)
+        hessian_model.eval()
+        with torch.inference_mode(), torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+            for seq in token_seqs:
+                x = seq[:, :-1].to(device)
+                y = seq[:, 1:].to(device)
+                hessian_model(x, y)
+        for h in hooks:
+            h.remove()
+        num_batches = len(token_seqs)
+        for name in local_hessians:
+            H = local_hessians[name]
+            H /= num_batches
+            damp = damp_ratio * torch.diag(H).mean().clamp_min(1e-6)
+            H += damp * torch.eye(H.shape[0])
+        hessians.update(local_hessians)
+    remaining_names = set()
+    for name, module in hessian_model.named_modules():
+        if isinstance(module, CastedLinear):
+            pname = name + ".weight"
+            if pname not in hessians:
+                remaining_names.add(pname)
+    if remaining_names:
+        hooks = []
+        local_hessians = {}
+        for name, module in hessian_model.named_modules():
+            if not isinstance(module, CastedLinear):
+                continue
+            pname = name + ".weight"
+            if pname not in remaining_names:
+                continue
+            cols = module.weight.shape[1]
+            local_hessians[pname] = torch.zeros(cols, cols, dtype=torch.float32, device='cpu')
+            def make_hook(pname):
+                def hook_fn(module, input, output):
+                    x = input[0].detach().float()
+                    if x.ndim == 3:
+                        x = x.reshape(-1, x.shape[-1])
+                    local_hessians[pname] += (x.T @ x).cpu()
+                return hook_fn
+            h = module.register_forward_hook(make_hook(pname))
+            hooks.append(h)
+        hessian_model.eval()
+        combined_seqs = attn_token_seqs + mlp_token_seqs
+        with torch.inference_mode(), torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+            for seq in combined_seqs:
+                x = seq[:, :-1].to(device)
+                y = seq[:, 1:].to(device)
+                hessian_model(x, y)
+        for h in hooks:
+            h.remove()
+        num_batches = len(combined_seqs)
+        for name in local_hessians:
+            H = local_hessians[name]
+            H /= num_batches
+            damp = damp_ratio * torch.diag(H).mean().clamp_min(1e-6)
+            H += damp * torch.eye(H.shape[0])
+        hessians.update(local_hessians)
+    return hessians
+
+
 # --- GPTQ-lite int6 quantization ---
 
 def _classify_param(name: str) -> str:
@@ -1343,7 +1451,8 @@ def _rebank_state_dict(sd: dict[str, Tensor], num_layers: int, template_sd: dict
 
 class _HessianAttn(nn.Module):
     """Non-banked attention with CastedLinear layers for Hessian hooks."""
-    def __init__(self, dim, num_heads, num_kv_heads, rope_base, qk_gain_init):
+    def __init__(self, dim, num_heads, num_kv_heads, rope_base, qk_gain_init,
+                 layer_idx=0, qk_gain_init_schedule=""):
         super().__init__()
         self.num_heads, self.num_kv_heads = num_heads, num_kv_heads
         self.head_dim = dim // num_heads
@@ -1352,7 +1461,8 @@ class _HessianAttn(nn.Module):
         self.c_k = CastedLinear(dim, kv_dim, bias=False)
         self.c_v = CastedLinear(dim, kv_dim, bias=False)
         self.proj = CastedLinear(dim, dim, bias=False)
-        self.q_gain = nn.Parameter(torch.full((num_heads,), qk_gain_init, dtype=torch.float32))
+        effective_gain = _resolve_qk_gain_for_layer(qk_gain_init, qk_gain_init_schedule, layer_idx)
+        self.q_gain = nn.Parameter(torch.full((num_heads,), effective_gain, dtype=torch.float32))
         self.rope_dims = 0
         self.rotary = Rotary(self.head_dim, base=rope_base, train_seq_len=1024)
         self.use_xsa = False
@@ -1391,11 +1501,13 @@ class _HessianMLP(nn.Module):
         return self.proj(F.leaky_relu(self.fc(x), negative_slope=0.5).square())
 
 class _HessianBlock(nn.Module):
-    def __init__(self, dim, num_heads, num_kv_heads, mlp_mult, rope_base, qk_gain_init, layer_idx=0, ln_scale=False):
+    def __init__(self, dim, num_heads, num_kv_heads, mlp_mult, rope_base, qk_gain_init,
+                 layer_idx=0, ln_scale=False, qk_gain_init_schedule=""):
         super().__init__()
         self.attn_norm = RMSNorm()
         self.mlp_norm = RMSNorm()
-        self.attn = _HessianAttn(dim, num_heads, num_kv_heads, rope_base, qk_gain_init)
+        self.attn = _HessianAttn(dim, num_heads, num_kv_heads, rope_base, qk_gain_init,
+                                 layer_idx=layer_idx, qk_gain_init_schedule=qk_gain_init_schedule)
         self.mlp = _HessianMLP(dim, mlp_mult)
         self.attn_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
         self.mlp_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
@@ -1415,7 +1527,8 @@ class _HessianGPT(nn.Module):
                  mlp_mult, tie_embeddings, logit_softcap, rope_base, qk_gain_init,
                  bigram_vocab_size=0, bigram_dim=128, xsa_last_n=0,
                  rope_dims=0, ln_scale=False,
-                 ve_enabled=False, ve_dim=128, ve_layers="9,10"):
+                 ve_enabled=False, ve_dim=128, ve_layers="9,10",
+                 qk_gain_init_schedule=""):
         super().__init__()
         self.tie_embeddings = tie_embeddings
         self.logit_softcap = logit_softcap
@@ -1429,7 +1542,7 @@ class _HessianGPT(nn.Module):
         self.skip_weights = nn.Parameter(torch.ones(self.num_skip_weights, model_dim, dtype=torch.float32))
         self.blocks = nn.ModuleList([
             _HessianBlock(model_dim, num_heads, num_kv_heads, mlp_mult, rope_base, qk_gain_init,
-                          layer_idx=i, ln_scale=ln_scale)
+                          layer_idx=i, ln_scale=ln_scale, qk_gain_init_schedule=qk_gain_init_schedule)
             for i in range(num_layers)
         ])
         if rope_dims > 0:
@@ -1674,6 +1787,7 @@ def main() -> None:
         ve_layers=args.ve_layers,
         gated_attention=args.gated_attention,
         value_residual=args.value_residual,
+        qk_gain_init_schedule=args.qk_gain_init_schedule,
     ).to(device).bfloat16()
     # Banks stay FP32 (like CastedLinear weights), cast to BF16 in forward
     base_model.qo_bank.data = base_model.qo_bank.data.float()
@@ -2003,6 +2117,7 @@ def main() -> None:
         bigram_vocab_size=args.bigram_vocab_size, bigram_dim=args.bigram_dim,
         xsa_last_n=args.xsa_last_n, rope_dims=args.rope_dims, ln_scale=args.ln_scale,
         ve_enabled=args.ve_enabled, ve_dim=args.ve_dim, ve_layers=args.ve_layers,
+        qk_gain_init_schedule=args.qk_gain_init_schedule,
     ).to(device).bfloat16()
     for m in hessian_model.modules():
         if isinstance(m, CastedLinear):
@@ -2018,27 +2133,57 @@ def main() -> None:
     if args.calib_prompt_text:
         prompt_ids = torch.tensor(sp.encode(args.calib_prompt_text), dtype=torch.long)
         log0(f"gptq:using prompt text ({prompt_ids.numel()} tokens): {args.calib_prompt_text[:80]!r}")
-    calib_total_tokens = args.calib_num_seqs * args.calib_seq_len
-    log0(f"gptq:generating AR calibration data ({args.calib_num_seqs} seqs x {args.calib_seq_len} tokens, "
-         f"temp={args.calib_temperature}, top_p={args.calib_top_p}, top_k={args.calib_top_k}, "
-         f"batch_size={args.calib_batch_size}, total_tokens={calib_total_tokens})...")
     base_model.load_state_dict(export_sd, strict=False)
-    t_gen = time.perf_counter()
-    ar_tokens = generate_autoregressive_calib(
-        base_model, device, num_seqs=args.calib_num_seqs, seq_len=args.calib_seq_len,
-        vocab_size=args.vocab_size, temperature=args.calib_temperature,
-        batch_size=args.calib_batch_size, seed=args.seed,
-        top_p=args.calib_top_p, top_k=args.calib_top_k, prompt_ids=prompt_ids,
-    )
-    gen_time = time.perf_counter() - t_gen
-    log0(f"gptq:generated {len(ar_tokens)} sequences in {gen_time:.1f}s "
-         f"({calib_total_tokens / gen_time:.0f} tok/s)")
-    log0(f"gptq:collecting hessians from AR data (damp_ratio={args.gptq_damp_ratio})...")
-    t_hess = time.perf_counter()
-    hessians = collect_hessians_from_tokens(hessian_model, ar_tokens, device, damp_ratio=args.gptq_damp_ratio)
-    hess_time = time.perf_counter() - t_hess
-    log0(f"gptq:collected hessians for {len(hessians)} layers in {hess_time:.1f}s (AR self-gen)")
-    del ar_tokens
+    if args.calib_split_by_module:
+        attn_total = args.calib_attn_num_seqs * args.calib_attn_seq_len
+        mlp_total = args.calib_mlp_num_seqs * args.calib_mlp_seq_len
+        log0(f"gptq:mixed-regime calibration enabled")
+        log0(f"gptq:attn: {args.calib_attn_num_seqs} seqs x {args.calib_attn_seq_len} tokens ({attn_total} total)")
+        log0(f"gptq:mlp:  {args.calib_mlp_num_seqs} seqs x {args.calib_mlp_seq_len} tokens ({mlp_total} total)")
+        t_gen = time.perf_counter()
+        attn_tokens = generate_autoregressive_calib(
+            base_model, device, num_seqs=args.calib_attn_num_seqs, seq_len=args.calib_attn_seq_len,
+            vocab_size=args.vocab_size, temperature=args.calib_temperature,
+            batch_size=args.calib_batch_size, seed=args.seed,
+            top_p=args.calib_top_p, top_k=args.calib_top_k, prompt_ids=prompt_ids,
+        )
+        mlp_tokens = generate_autoregressive_calib(
+            base_model, device, num_seqs=args.calib_mlp_num_seqs, seq_len=args.calib_mlp_seq_len,
+            vocab_size=args.vocab_size, temperature=args.calib_temperature,
+            batch_size=args.calib_batch_size, seed=args.seed + 1000,
+            top_p=args.calib_top_p, top_k=args.calib_top_k, prompt_ids=prompt_ids,
+        )
+        gen_time = time.perf_counter() - t_gen
+        log0(f"gptq:generated attn({len(attn_tokens)}) + mlp({len(mlp_tokens)}) seqs in {gen_time:.1f}s")
+        log0(f"gptq:collecting split hessians (damp_ratio={args.gptq_damp_ratio})...")
+        t_hess = time.perf_counter()
+        hessians = collect_hessians_split_by_module(
+            hessian_model, attn_tokens, mlp_tokens, device, damp_ratio=args.gptq_damp_ratio,
+        )
+        hess_time = time.perf_counter() - t_hess
+        log0(f"gptq:collected {len(hessians)} split hessians in {hess_time:.1f}s")
+        del attn_tokens, mlp_tokens
+    else:
+        calib_total_tokens = args.calib_num_seqs * args.calib_seq_len
+        log0(f"gptq:generating AR calibration data ({args.calib_num_seqs} seqs x {args.calib_seq_len} tokens, "
+             f"temp={args.calib_temperature}, top_p={args.calib_top_p}, top_k={args.calib_top_k}, "
+             f"batch_size={args.calib_batch_size}, total_tokens={calib_total_tokens})...")
+        t_gen = time.perf_counter()
+        ar_tokens = generate_autoregressive_calib(
+            base_model, device, num_seqs=args.calib_num_seqs, seq_len=args.calib_seq_len,
+            vocab_size=args.vocab_size, temperature=args.calib_temperature,
+            batch_size=args.calib_batch_size, seed=args.seed,
+            top_p=args.calib_top_p, top_k=args.calib_top_k, prompt_ids=prompt_ids,
+        )
+        gen_time = time.perf_counter() - t_gen
+        log0(f"gptq:generated {len(ar_tokens)} sequences in {gen_time:.1f}s "
+             f"({calib_total_tokens / gen_time:.0f} tok/s)")
+        log0(f"gptq:collecting hessians from AR data (damp_ratio={args.gptq_damp_ratio})...")
+        t_hess = time.perf_counter()
+        hessians = collect_hessians_from_tokens(hessian_model, ar_tokens, device, damp_ratio=args.gptq_damp_ratio)
+        hess_time = time.perf_counter() - t_hess
+        log0(f"gptq:collected hessians for {len(hessians)} layers in {hess_time:.1f}s (AR self-gen)")
+        del ar_tokens
     del hessian_model
     torch.cuda.empty_cache()
     log0(f"gptq:quantizing with block_size={args.gptq_block_size}, damp_ratio={args.gptq_damp_ratio}...")
@@ -2130,6 +2275,7 @@ def main() -> None:
         rope_dims=args.rope_dims, ln_scale=args.ln_scale, dtg=args.dtg_enabled,
         ve_enabled=args.ve_enabled, ve_dim=args.ve_dim, ve_layers=args.ve_layers,
         gated_attention=args.gated_attention, value_residual=args.value_residual,
+        qk_gain_init_schedule=args.qk_gain_init_schedule,
     ).to(device).bfloat16()
     eval_model.qo_bank.data = eval_model.qo_bank.data.float()
     eval_model.kv_bank.data = eval_model.kv_bank.data.float()

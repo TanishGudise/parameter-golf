@@ -21,9 +21,25 @@ export CALIB_TOP_K="${CALIB_TOP_K:-0}"
 export GPTQ_BLOCK_SIZE="${GPTQ_BLOCK_SIZE:-128}"
 export GPTQ_DAMP_RATIO="${GPTQ_DAMP_RATIO:-0.01}"
 
+# Mixed-regime calibration (set CALIB_SPLIT_BY_MODULE=1 to enable)
+export CALIB_SPLIT_BY_MODULE="${CALIB_SPLIT_BY_MODULE:-0}"
+export CALIB_ATTN_NUM_SEQS="${CALIB_ATTN_NUM_SEQS:-${CALIB_NUM_SEQS}}"
+export CALIB_ATTN_SEQ_LEN="${CALIB_ATTN_SEQ_LEN:-${CALIB_SEQ_LEN}}"
+export CALIB_MLP_NUM_SEQS="${CALIB_MLP_NUM_SEQS:-${CALIB_NUM_SEQS}}"
+export CALIB_MLP_SEQ_LEN="${CALIB_MLP_SEQ_LEN:-${CALIB_SEQ_LEN}}"
+
+# Per-layer QK-gain init schedule (empty = use global QK_GAIN_INIT)
+export QK_GAIN_INIT_SCHEDULE="${QK_GAIN_INIT_SCHEDULE:-}"
+
 echo "Record run config:"
 echo "  CALIB: ${CALIB_NUM_SEQS}x${CALIB_SEQ_LEN} temp=${CALIB_TEMPERATURE} top_p=${CALIB_TOP_P} top_k=${CALIB_TOP_K}"
 echo "  GPTQ: block_size=${GPTQ_BLOCK_SIZE} damp_ratio=${GPTQ_DAMP_RATIO}"
+if [ "${CALIB_SPLIT_BY_MODULE}" = "1" ]; then
+    echo "  Mixed-regime: attn=${CALIB_ATTN_NUM_SEQS}x${CALIB_ATTN_SEQ_LEN} mlp=${CALIB_MLP_NUM_SEQS}x${CALIB_MLP_SEQ_LEN}"
+fi
+if [ -n "${QK_GAIN_INIT_SCHEDULE}" ]; then
+    echo "  QK-gain schedule: ${QK_GAIN_INIT_SCHEDULE}"
+fi
 echo "  Output: $RECORD_DIR"
 echo ""
 

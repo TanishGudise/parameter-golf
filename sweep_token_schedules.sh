@@ -28,10 +28,12 @@ run_sweep() {
 }
 
 # --- Sequence schedule sweep (constant total tokens ~131072, temp=0.8) ---
-run_sweep "sched_64x2048_t0.8"  CALIB_NUM_SEQS=64  CALIB_SEQ_LEN=2048 CALIB_TEMPERATURE=0.8
-run_sweep "sched_128x1024_t0.8" CALIB_NUM_SEQS=128 CALIB_SEQ_LEN=1024 CALIB_TEMPERATURE=0.8
-run_sweep "sched_256x512_t0.8"  CALIB_NUM_SEQS=256 CALIB_SEQ_LEN=512  CALIB_TEMPERATURE=0.8
-run_sweep "sched_512x256_t0.8"  CALIB_NUM_SEQS=512 CALIB_SEQ_LEN=256  CALIB_TEMPERATURE=0.8
+run_sweep "sched_64x2048_t0.8"   CALIB_NUM_SEQS=64   CALIB_SEQ_LEN=2048 CALIB_TEMPERATURE=0.8
+run_sweep "sched_128x1024_t0.8"  CALIB_NUM_SEQS=128  CALIB_SEQ_LEN=1024 CALIB_TEMPERATURE=0.8
+run_sweep "sched_256x512_t0.8"   CALIB_NUM_SEQS=256  CALIB_SEQ_LEN=512  CALIB_TEMPERATURE=0.8
+run_sweep "sched_512x256_t0.8"   CALIB_NUM_SEQS=512  CALIB_SEQ_LEN=256  CALIB_TEMPERATURE=0.8
+run_sweep "sched_1024x128_t0.8"  CALIB_NUM_SEQS=1024 CALIB_SEQ_LEN=128  CALIB_TEMPERATURE=0.8
+run_sweep "sched_2048x64_t0.8"   CALIB_NUM_SEQS=2048 CALIB_SEQ_LEN=64   CALIB_TEMPERATURE=0.8
 
 # --- Temperature sweep (best schedule from above, or default 64x2048 for now) ---
 for temp in 0.6 0.7 0.8 0.9 1.0 1.2; do
