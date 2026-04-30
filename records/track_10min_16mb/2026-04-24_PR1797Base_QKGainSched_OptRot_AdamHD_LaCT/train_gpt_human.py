@@ -307,6 +307,11 @@ class Hyperparameters:
     ttt_batch_size = int(os.environ.get("TTT_BATCH_SIZE", 64))
     ttt_grad_steps = int(os.environ.get("TTT_GRAD_STEPS", 1))
     ttt_grad_steps_clean = bool(int(os.environ.get("TTT_GRAD_STEPS_CLEAN", "0")))
+    # LeakyReLU² slope for MLP activation. Default 0.5 preserves prior behavior exactly.
+    # Set to 0.3 for the PR #1948 improvement (−0.00073 BPB, size/wallclock neutral).
+    # BWD_COEFF = 2 * slope² is the Triton backward gradient coefficient.
+    leaky_relu_slope = float(os.environ.get("LEAKY_RELU_SLOPE", "0.5"))
+    leaky_relu_bwd_coeff = 2.0 * leaky_relu_slope * leaky_relu_slope
     ttt_weight_decay = float(os.environ.get("TTT_WEIGHT_DECAY", 1.0))
     ttt_beta1 = float(os.environ.get("TTT_BETA1", 0))
     ttt_beta2 = float(os.environ.get("TTT_BETA2", 0.999))
@@ -857,6 +862,8 @@ def linear_leaky_relu_square_kernel(
     BLOCK_SIZE_K: tl.constexpr,
     NUM_SMS: tl.constexpr,
     FORWARD: tl.constexpr,
+    SLOPE: tl.constexpr,
+    BWD_COEFF: tl.constexpr,
 ):
     dtype = tl.bfloat16
     start_pid = tl.program_id(axis=0)
@@ -887,18 +894,18 @@ def linear_leaky_relu_square_kernel(
         if not FORWARD:
             pre0 = aux_desc.load([offs_am_c, offs_bn_c])
             pre1 = aux_desc.load([offs_am_c, offs_bn_c + BLOCK_SIZE_N // 2])
-            c0 = c0 * tl.where(pre0 > 0, 2.0 * pre0, 0.5 * pre0)
-            c1 = c1 * tl.where(pre1 > 0, 2.0 * pre1, 0.5 * pre1)
+            c0 = c0 * tl.where(pre0 > 0, 2.0 * pre0, BWD_COEFF * pre0)
+            c1 = c1 * tl.where(pre1 > 0, 2.0 * pre1, BWD_COEFF * pre1)
         c_desc.store([offs_am_c, offs_bn_c], c0)
         c_desc.store([offs_am_c, offs_bn_c + BLOCK_SIZE_N // 2], c1)
         if FORWARD:
-            aux0 = tl.where(c0 > 0, c0, 0.5 * c0)
-            aux1 = tl.where(c1 > 0, c1, 0.5 * c1)
+            aux0 = tl.where(c0 > 0, c0, SLOPE * c0)
+            aux1 = tl.where(c1 > 0, c1, SLOPE * c1)
             aux_desc.store([offs_am_c, offs_bn_c], aux0 * aux0)
             aux_desc.store([offs_am_c, offs_bn_c + BLOCK_SIZE_N // 2], aux1 * aux1)
 
 
-def linear_leaky_relu_square(a, b, aux=None):
+def linear_leaky_relu_square(a, b, aux=None, slope=0.5, bwd_coeff=0.5):
     M, K = a.shape
     N, K2 = b.shape
     assert K == K2
@@ -929,6 +936,8 @@ def linear_leaky_relu_square(a, b, aux=None):
         BLOCK_SIZE_K=BLOCK_SIZE_K,
         NUM_SMS=num_sms,
         FORWARD=forward,
+        SLOPE=slope,
+        BWD_COEFF=bwd_coeff,
         num_stages=num_stages,
         num_warps=8,
     )
@@ -939,26 +948,31 @@ def linear_leaky_relu_square(a, b, aux=None):
 
 class FusedLinearLeakyReLUSquareFunction(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, x, w1, w2):
+    def forward(ctx, x, w1, w2, slope, bwd_coeff):
         x_flat = x.reshape(-1, x.shape[-1])
-        pre, post = linear_leaky_relu_square(x_flat, w1)
+        pre, post = linear_leaky_relu_square(x_flat, w1, slope=slope, bwd_coeff=bwd_coeff)
         out = F.linear(post, w2)
         ctx.save_for_backward(x, w1, w2, pre, post)
+        ctx._slope = slope
+        ctx._bwd_coeff = bwd_coeff
         return out.view(*x.shape[:-1], out.shape[-1])
 
     @staticmethod
     def backward(ctx, grad_output):
         x, w1, w2, pre, post = ctx.saved_tensors
+        slope = ctx._slope
+        bwd_coeff = ctx._bwd_coeff
         x_flat = x.reshape(-1, x.shape[-1])
         grad_output_flat = grad_output.reshape(-1, grad_output.shape[-1])
         dw2 = grad_output_flat.T @ post
-        dpre = linear_leaky_relu_square(grad_output_flat, w2.T.contiguous(), aux=pre)
+        dpre = linear_leaky_relu_square(
+            grad_output_flat, w2.T.contiguous(), aux=pre,
+            slope=slope, bwd_coeff=bwd_coeff,
+        )
         dw1 = dpre.T @ x_flat
         dx = dpre @ w1
-        return dx.view_as(x), dw1, dw2
-
-
-FusedLeakyReLUSquareMLP = FusedLinearLeakyReLUSquareFunction.apply
+        # 4 inputs + slope + bwd_coeff → 6 grads; slope/bwd_coeff are not tensors
+        return dx.view_as(x), dw1, dw2, None, None
 
 
 class Rotary(nn.Module):
@@ -1145,14 +1159,19 @@ class CausalSelfAttention(nn.Module):
 
 
 class MLP(nn.Module):
-    def __init__(self, dim, mlp_mult):
+    def __init__(self, dim, mlp_mult, slope=0.5, bwd_coeff=0.5):
         super().__init__()
         self.use_fused = True
+        self._slope = slope
+        self._bwd_coeff = bwd_coeff
 
     def forward(self, x, up_w, down_w):
         if self.training and self.use_fused:
-            return FusedLeakyReLUSquareMLP(x, up_w.to(x.dtype), down_w.to(x.dtype))
-        hidden = F.leaky_relu(F.linear(x, up_w.to(x.dtype)), negative_slope=0.5).square()
+            return FusedLeakyReLUSquareMLP(
+                x, up_w.to(x.dtype), down_w.to(x.dtype),
+                self._slope, self._bwd_coeff,
+            )
+        hidden = F.leaky_relu(F.linear(x, up_w.to(x.dtype)), negative_slope=self._slope).square()
         self._last_down_input = hidden.detach() if getattr(self, "_calib", False) else None
         return F.linear(hidden, down_w.to(x.dtype))
 
@@ -1178,6 +1197,8 @@ class Block(nn.Module):
         sparse_attn_gate=False,
         sparse_attn_gate_init_std=0.0,
         sparse_attn_gate_scale=1.0,
+        leaky_relu_slope=0.5,
+        leaky_relu_bwd_coeff=0.5,
     ):
         super().__init__()
         self.attn_norm = RMSNorm()
@@ -1190,7 +1211,7 @@ class Block(nn.Module):
             sparse_attn_gate_init_std=sparse_attn_gate_init_std,
             sparse_attn_gate_scale=sparse_attn_gate_scale,
         )
-        self.mlp = MLP(dim, mlp_mult)
+        self.mlp = MLP(dim, mlp_mult, slope=leaky_relu_slope, bwd_coeff=leaky_relu_bwd_coeff)
         self.attn_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
         self.mlp_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
         self.resid_mix = nn.Parameter(
@@ -1258,6 +1279,8 @@ class GPT(nn.Module):
                     sparse_attn_gate=h.sparse_attn_gate_enabled,
                     sparse_attn_gate_init_std=h.sparse_attn_gate_init_std,
                     sparse_attn_gate_scale=h.sparse_attn_gate_scale,
+                    leaky_relu_slope=h.leaky_relu_slope,
+                    leaky_relu_bwd_coeff=h.leaky_relu_bwd_coeff,
                 )
                 for i in range(h.num_layers)
             ]
