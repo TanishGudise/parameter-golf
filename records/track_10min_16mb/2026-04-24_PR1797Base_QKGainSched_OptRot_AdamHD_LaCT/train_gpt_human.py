@@ -946,33 +946,48 @@ def linear_leaky_relu_square(a, b, aux=None, slope=0.5, bwd_coeff=0.5):
     return c
 
 
-class FusedLinearLeakyReLUSquareFunction(torch.autograd.Function):
-    @staticmethod
-    def forward(ctx, x, w1, w2, slope, bwd_coeff):
-        x_flat = x.reshape(-1, x.shape[-1])
-        pre, post = linear_leaky_relu_square(x_flat, w1, slope=slope, bwd_coeff=bwd_coeff)
-        out = F.linear(post, w2)
-        ctx.save_for_backward(x, w1, w2, pre, post)
-        ctx._slope = slope
-        ctx._bwd_coeff = bwd_coeff
-        return out.view(*x.shape[:-1], out.shape[-1])
+_FUSED_MLP_FN_CACHE: dict = {}
 
-    @staticmethod
-    def backward(ctx, grad_output):
-        x, w1, w2, pre, post = ctx.saved_tensors
-        slope = ctx._slope
-        bwd_coeff = ctx._bwd_coeff
-        x_flat = x.reshape(-1, x.shape[-1])
-        grad_output_flat = grad_output.reshape(-1, grad_output.shape[-1])
-        dw2 = grad_output_flat.T @ post
-        dpre = linear_leaky_relu_square(
-            grad_output_flat, w2.T.contiguous(), aux=pre,
-            slope=slope, bwd_coeff=bwd_coeff,
-        )
-        dw1 = dpre.T @ x_flat
-        dx = dpre @ w1
-        # 4 inputs + slope + bwd_coeff → 6 grads; slope/bwd_coeff are not tensors
-        return dx.view_as(x), dw1, dw2, None, None
+
+def _make_fused_mlp_fn(slope: float, bwd_coeff: float):
+    """Factory returning an autograd.Function subclass with slope/bwd_coeff baked in.
+
+    Passing float args through .apply() causes dynamo to create symbolic guards
+    and loop-recompile. By closing over the values here, .apply() receives only
+    tensor args, which is the torch.compile-compatible pattern.
+    """
+    key = (slope, bwd_coeff)
+    if key in _FUSED_MLP_FN_CACHE:
+        return _FUSED_MLP_FN_CACHE[key]
+
+    _s, _b = slope, bwd_coeff
+
+    class _Fn(torch.autograd.Function):
+        @staticmethod
+        def forward(ctx, x, w1, w2):
+            x_flat = x.reshape(-1, x.shape[-1])
+            pre, post = linear_leaky_relu_square(x_flat, w1, slope=_s, bwd_coeff=_b)
+            out = F.linear(post, w2)
+            ctx.save_for_backward(x, w1, w2, pre, post)
+            return out.view(*x.shape[:-1], out.shape[-1])
+
+        @staticmethod
+        def backward(ctx, grad_output):
+            x, w1, w2, pre, post = ctx.saved_tensors
+            x_flat = x.reshape(-1, x.shape[-1])
+            grad_output_flat = grad_output.reshape(-1, grad_output.shape[-1])
+            dw2 = grad_output_flat.T @ post
+            dpre = linear_leaky_relu_square(
+                grad_output_flat, w2.T.contiguous(), aux=pre,
+                slope=_s, bwd_coeff=_b,
+            )
+            dw1 = dpre.T @ x_flat
+            dx = dpre @ w1
+            return dx.view_as(x), dw1, dw2
+
+    _Fn.__qualname__ = f"FusedLinearLeakyReLUSquareFunction_{slope}_{bwd_coeff}"
+    _FUSED_MLP_FN_CACHE[key] = _Fn
+    return _Fn
 
 
 class Rotary(nn.Module):
@@ -1164,12 +1179,12 @@ class MLP(nn.Module):
         self.use_fused = True
         self._slope = slope
         self._bwd_coeff = bwd_coeff
+        self._fused_fn = _make_fused_mlp_fn(slope, bwd_coeff)
 
     def forward(self, x, up_w, down_w):
         if self.training and self.use_fused:
-            return FusedLinearLeakyReLUSquareFunction.apply(
+            return self._fused_fn.apply(
                 x, up_w.to(x.dtype), down_w.to(x.dtype),
-                self._slope, self._bwd_coeff,
             )
         hidden = F.leaky_relu(F.linear(x, up_w.to(x.dtype)), negative_slope=self._slope).square()
         self._last_down_input = hidden.detach() if getattr(self, "_calib", False) else None
