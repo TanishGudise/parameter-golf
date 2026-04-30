@@ -1167,7 +1167,7 @@ class MLP(nn.Module):
 
     def forward(self, x, up_w, down_w):
         if self.training and self.use_fused:
-            return FusedLeakyReLUSquareMLP(
+            return FusedLinearLeakyReLUSquareFunction.apply(
                 x, up_w.to(x.dtype), down_w.to(x.dtype),
                 self._slope, self._bwd_coeff,
             )
