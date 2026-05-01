@@ -257,6 +257,7 @@ class Hyperparameters:
     rope_train_seq_len = int(os.environ.get("ROPE_TRAIN_SEQ_LEN", 2048))
     rope_yarn = bool(int(os.environ.get("ROPE_YARN", "0")))
     ln_scale = bool(int(os.environ.get("LN_SCALE", "1")))
+    learnable_ln_scale = bool(int(os.environ.get("LEARNABLE_LN_SCALE", "0")))
     qk_gain_init = float(os.environ.get("QK_GAIN_INIT", 5.0))
     # Layer 1: per-layer QK-Gain init schedule. Comma-separated floats, one per physical
     # layer. Falls back to uniform qk_gain_init if empty. Schedule is an initialization
@@ -1245,6 +1246,7 @@ class Block(nn.Module):
         train_seq_len,
         layer_idx=0,
         ln_scale=False,
+        learnable_ln_scale=False,
         yarn=True,
         attn_out_gate=False,
         attn_out_gate_src="proj",
@@ -1272,13 +1274,22 @@ class Block(nn.Module):
         self.resid_mix = nn.Parameter(
             torch.stack((torch.ones(dim), torch.zeros(dim))).float()
         )
-        self.ln_scale_factor = 1.0 / math.sqrt(layer_idx + 1) if ln_scale else 1.0
+        _sf_val = 1.0 / math.sqrt(layer_idx + 1) if ln_scale else 1.0
+        if learnable_ln_scale:
+            self.ln_scale_factor = nn.Parameter(torch.tensor(_sf_val, dtype=torch.float32))
+        else:
+            self.ln_scale_factor = _sf_val
+
+    def _ln_sf(self, dtype):
+        if isinstance(self.ln_scale_factor, nn.Parameter):
+            return self.ln_scale_factor.to(dtype=dtype)
+        return self.ln_scale_factor
 
     def forward(self, x, x0, q_w, k_w, v_w, out_w, up_w, down_w, cu_seqlens=None, max_seqlen=0):
         mix = self.resid_mix.to(dtype=x.dtype)
         x_in = mix[0][None, None, :] * x + mix[1][None, None, :] * x0
         attn_out = self.attn(
-            self.attn_norm(x_in) * self.ln_scale_factor,
+            self.attn_norm(x_in) * self._ln_sf(x_in.dtype),
             q_w, k_w, v_w, out_w,
             cu_seqlens=cu_seqlens,
             max_seqlen=max_seqlen,
@@ -1286,7 +1297,7 @@ class Block(nn.Module):
         x_out = x_in + self.attn_scale.to(dtype=x_in.dtype)[None, None, :] * attn_out
         x_out = x_out + self.mlp_scale.to(dtype=x_out.dtype)[
             None, None, :
-        ] * self.mlp(self.mlp_norm(x_out) * self.ln_scale_factor, up_w, down_w)
+        ] * self.mlp(self.mlp_norm(x_out) * self._ln_sf(x_out.dtype), up_w, down_w)
         return x_out
 
 class GPT(nn.Module):
@@ -1329,6 +1340,7 @@ class GPT(nn.Module):
                     h.train_seq_len,
                     layer_idx=i,
                     ln_scale=h.ln_scale,
+                    learnable_ln_scale=h.learnable_ln_scale,
                     yarn=h.rope_yarn,
                     attn_out_gate=h.attn_out_gate_enabled,
                     attn_out_gate_src=h.attn_out_gate_src,
@@ -1456,14 +1468,14 @@ class GPT(nn.Module):
         mix = block.resid_mix.to(dtype=lane0.dtype)
         attn_read = mix[0][None, None, :] * lane0 + mix[1][None, None, :] * x0
         attn_out = block.attn(
-            block.attn_norm(attn_read) * block.ln_scale_factor,
+            block.attn_norm(attn_read) * block._ln_sf(attn_read.dtype),
             q_w, k_w, v_w, out_w,
             cu_seqlens=cu_seqlens, max_seqlen=max_seqlen,
         )
         attn_out = block.attn_scale.to(dtype=attn_out.dtype)[None, None, :] * attn_out
         mlp_read = lane1
         mlp_out = block.mlp_scale.to(dtype=lane1.dtype)[None, None, :] * block.mlp(
-            block.mlp_norm(mlp_read) * block.ln_scale_factor, up_w, down_w
+            block.mlp_norm(mlp_read) * block._ln_sf(lane1.dtype), up_w, down_w
         )
         attn_resid = self.parallel_resid_lambdas[block_idx, 0].to(dtype=lane0.dtype)
         attn_post = self.parallel_post_lambdas[block_idx, 0].to(dtype=lane0.dtype)
@@ -1700,7 +1712,7 @@ class GPT(nn.Module):
     def _block_with_lora(self, block, x, x0, lora, slot, q_w, k_w, v_w, out_w, up_w, down_w):
         mix = block.resid_mix.to(dtype=x.dtype)
         x_in = mix[0][None, None, :] * x + mix[1][None, None, :] * x0
-        n = block.attn_norm(x_in) * block.ln_scale_factor
+        n = block.attn_norm(x_in) * block._ln_sf(x_in.dtype)
         attn = block.attn
         bsz, seqlen, dim = n.shape
         # Keep raw Q for AttnOutGate src='q' (matches forward path semantics).
@@ -1749,7 +1761,7 @@ class GPT(nn.Module):
         if lora.o_loras is not None:
             attn_out = attn_out + lora.o_loras[slot](n)
         x_out = x_in + block.attn_scale.to(dtype=x_in.dtype)[None, None, :] * attn_out
-        mlp_n = block.mlp_norm(x_out) * block.ln_scale_factor
+        mlp_n = block.mlp_norm(x_out) * block._ln_sf(x_out.dtype)
         mlp_out = block.mlp(mlp_n, up_w, down_w)
         if lora.mlp_loras is not None:
             mlp_out = mlp_out + lora.mlp_loras[slot](mlp_n)
@@ -1763,7 +1775,7 @@ class GPT(nn.Module):
         block = self.blocks[block_idx]
         mix = block.resid_mix.to(dtype=lane0.dtype)
         attn_read = mix[0][None, None, :] * lane0 + mix[1][None, None, :] * x0
-        n = block.attn_norm(attn_read) * block.ln_scale_factor
+        n = block.attn_norm(attn_read) * block._ln_sf(attn_read.dtype)
         attn = block.attn
         bsz, seqlen, dim = n.shape
         q_raw = F.linear(n, q_w.to(n.dtype)) + lora.q_loras[slot](n)
@@ -1810,7 +1822,7 @@ class GPT(nn.Module):
             attn_out = attn_out + lora.o_loras[slot](n)
         attn_out = block.attn_scale.to(dtype=attn_out.dtype)[None, None, :] * attn_out
         mlp_read = lane1
-        mlp_n = block.mlp_norm(mlp_read) * block.ln_scale_factor
+        mlp_n = block.mlp_norm(mlp_read) * block._ln_sf(lane1.dtype)
         mlp_out = block.mlp(mlp_n, up_w, down_w)
         if lora.mlp_loras is not None:
             mlp_out = mlp_out + lora.mlp_loras[slot](mlp_n)
